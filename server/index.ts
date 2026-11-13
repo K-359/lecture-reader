@@ -3,6 +3,7 @@ import { serve } from '@hono/node-server'
 import { config } from 'dotenv'
 import { Hono } from 'hono'
 import { buildReadPrompt, SYSTEM_PROMPT, type ReadUnit } from './prompt.ts'
+import { listStyles, synthesize, VoicevoxUnavailableError } from './voicevox.ts'
 
 // .env の値を、起動元のシェルから引き継いだ環境変数より優先する
 config({ override: true })
@@ -44,6 +45,40 @@ function isReadRequest(body: unknown): body is ReadRequest {
 }
 
 app.get('/api/health', (c) => c.json({ ok: true, model: MODEL }))
+
+// ---------- VOICEVOX ----------
+
+app.get('/api/tts/speakers', async (c) => {
+  try {
+    return c.json({ styles: await listStyles() })
+  } catch (error) {
+    if (error instanceof VoicevoxUnavailableError) return c.json({ error: error.message }, 503)
+    console.error('[tts] 話者一覧の取得に失敗:', error)
+    return c.json({ error: 'VOICEVOX の話者一覧を取れませんでした。' }, 502)
+  }
+})
+
+app.post('/api/tts', async (c) => {
+  const body = (await c.req.json().catch(() => null)) as { text?: unknown; speaker?: unknown; speed?: unknown } | null
+  const text = typeof body?.text === 'string' ? body.text.trim() : ''
+  const speaker = typeof body?.speaker === 'number' ? body.speaker : NaN
+  const speed = typeof body?.speed === 'number' ? Math.min(2, Math.max(0.5, body.speed)) : 1
+  if (!text || text.length > 1000 || !Number.isInteger(speaker)) {
+    return c.json({ error: 'リクエストの形式が正しくありません。' }, 400)
+  }
+  try {
+    const startedAt = Date.now()
+    const wav = await synthesize(text, speaker, speed)
+    console.log(`[tts] ${Date.now() - startedAt}ms ${text.length}文字`)
+    return c.body(wav, 200, { 'Content-Type': 'audio/wav' })
+  } catch (error) {
+    if (error instanceof VoicevoxUnavailableError) return c.json({ error: error.message }, 503)
+    console.error('[tts] 音声の合成に失敗:', error)
+    return c.json({ error: 'VOICEVOX で音声を作れませんでした。' }, 502)
+  }
+})
+
+// ---------- VLM での読み取り ----------
 
 app.post('/api/read', async (c) => {
   const body: unknown = await c.req.json().catch(() => null)

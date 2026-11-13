@@ -2,7 +2,15 @@ import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react
 import { readAt, type ReadUnit } from './lib/api'
 import { captureAround } from './lib/capture'
 import { isCancelled, openPdf, pageAspect, renderPage, type PDFDocumentProxy, type PDFPageProxy } from './lib/pdf'
-import { speak, speechSupported, stopSpeech, unlockSpeech } from './lib/speech'
+import {
+  fetchVoicevoxStyles,
+  speak,
+  speechSupported,
+  stopSpeech,
+  unlockSpeech,
+  type VoiceEngine,
+  type VoicevoxStyle,
+} from './lib/speech'
 import { toSpeakable } from './lib/speechText'
 import { findTextAt, prefetchText, type Box } from './lib/textLayer'
 import './App.css'
@@ -38,6 +46,14 @@ export default function App() {
   const [text, setText] = useState('')
   const [mode, setMode] = useState<ReadMode>(() => (localStorage.getItem('mode') === 'ai' ? 'ai' : 'auto'))
   const [result, setResult] = useState<{ source: Source; ms: number } | null>(null)
+  /** クリックしてから声が出始めるまでの時間 */
+  const [voiceMs, setVoiceMs] = useState<number | null>(null)
+  const [engine, setEngine] = useState<VoiceEngine>(() =>
+    localStorage.getItem('engine') === 'voicevox' ? 'voicevox' : 'browser',
+  )
+  const [speaker, setSpeaker] = useState(() => loadNumber('speaker', 2))
+  const [styles, setStyles] = useState<VoicevoxStyle[]>([])
+  const [voiceNotice, setVoiceNotice] = useState('')
   const [highlights, setHighlights] = useState<Box[]>([])
   const [marker, setMarker] = useState<{ x: number; y: number } | null>(null)
   const [dragging, setDragging] = useState(false)
@@ -50,6 +66,24 @@ export default function App() {
 
   useEffect(() => localStorage.setItem('unit', unit), [unit])
   useEffect(() => localStorage.setItem('rate', String(rate)), [rate])
+  useEffect(() => localStorage.setItem('engine', engine), [engine])
+  useEffect(() => localStorage.setItem('speaker', String(speaker)), [speaker])
+
+  // VOICEVOX を選んだら話者の一覧を取る
+  useEffect(() => {
+    if (engine !== 'voicevox') return
+    let alive = true
+    fetchVoicevoxStyles()
+      .then((list) => {
+        if (!alive) return
+        setStyles(list)
+        setVoiceNotice('')
+      })
+      .catch((e: unknown) => alive && setVoiceNotice(e instanceof Error ? e.message : String(e)))
+    return () => {
+      alive = false
+    }
+  }, [engine])
   useEffect(() => localStorage.setItem('mode', mode), [mode])
 
   // 表示領域の幅に合わせてページを描くため、幅の変化を見張る
@@ -117,11 +151,19 @@ export default function App() {
   }, [])
 
   const say = useCallback(
-    (t: string) => {
+    (t: string, startedAt = performance.now()) => {
       setStatus({ kind: 'speaking' })
-      speak(toSpeakable(t), rate, () => setStatus((s) => (s.kind === 'speaking' ? { kind: 'idle' } : s)))
+      setVoiceMs(null)
+      speak(toSpeakable(t), {
+        engine,
+        rate,
+        speaker,
+        onStart: () => setVoiceMs(performance.now() - startedAt),
+        onEnd: () => setStatus((s) => (s.kind === 'speaking' ? { kind: 'idle' } : s)),
+        onFallback: (message) => setVoiceNotice(`${message}（ブラウザの声で読みます）`),
+      })
     },
-    [rate],
+    [engine, rate, speaker],
   )
 
   const onPageClick = async (e: MouseEvent<HTMLCanvasElement>) => {
@@ -138,6 +180,7 @@ export default function App() {
 
     setMarker({ x, y })
     setHighlights([])
+    setVoiceMs(null)
     setStatus({ kind: 'reading' })
     const startedAt = performance.now()
     try {
@@ -148,7 +191,7 @@ export default function App() {
         setText(hit.text)
         setHighlights(hit.boxes)
         setResult({ source: 'pdf', ms: performance.now() - startedAt })
-        say(hit.text)
+        say(hit.text, startedAt)
         return
       }
       // 文字データがない・図の上・AI を選んだとき は VLM で読み取る
@@ -157,7 +200,7 @@ export default function App() {
       if (controller.signal.aborted) return
       setText(read)
       setResult({ source: 'ai', ms: performance.now() - startedAt })
-      say(read)
+      say(read, startedAt)
     } catch (err) {
       if (controller.signal.aborted) return
       setStatus({ kind: 'error', message: err instanceof Error ? err.message : '読み取りに失敗しました。' })
@@ -304,6 +347,39 @@ export default function App() {
           </button>
         </div>
 
+        <div className="group" role="group" aria-label="声">
+          <button
+            type="button"
+            className={`btn toggle ${engine === 'browser' ? 'on' : ''}`}
+            aria-pressed={engine === 'browser'}
+            onClick={() => setEngine('browser')}
+          >
+            標準の声
+          </button>
+          <button
+            type="button"
+            className={`btn toggle ${engine === 'voicevox' ? 'on' : ''}`}
+            aria-pressed={engine === 'voicevox'}
+            onClick={() => setEngine('voicevox')}
+          >
+            VOICEVOX
+          </button>
+          {engine === 'voicevox' && styles.length > 0 && (
+            <select
+              className="select"
+              aria-label="VOICEVOX の話者"
+              value={speaker}
+              onChange={(e) => setSpeaker(Number(e.target.value))}
+            >
+              {styles.map((st) => (
+                <option key={st.id} value={st.id}>
+                  {st.speaker}（{st.style}）
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+
         <label className="rate">
           <span>速さ {rate.toFixed(1)}</span>
           <input
@@ -365,11 +441,18 @@ export default function App() {
           {result && status.kind !== 'error' && status.kind !== 'reading' && (
             <span className="badge source">
               {result.source === 'pdf' ? 'PDFの文字' : 'AIで読み取り'}・{(result.ms / 1000).toFixed(1)}秒
+              {voiceMs !== null && `／声まで ${(voiceMs / 1000).toFixed(1)}秒`}
             </span>
           )}
+          {voiceNotice && <span className="badge error">{voiceNotice}</span>}
           {!speechSupported && <span className="badge error">このブラウザは読み上げに対応していません</span>}
         </div>
         <p className="reader-text">{text || '読み取った文字がここに大きく表示されます。'}</p>
+        {engine === 'voicevox' && styles.length > 0 && (
+          <p className="credit">
+            音声：VOICEVOX:{styles.find((st) => st.id === speaker)?.speaker ?? ''}
+          </p>
+        )}
         <div className="reader-actions">
           <button type="button" className="btn" onClick={() => say(text)} disabled={!text || busy}>
             もう一度
