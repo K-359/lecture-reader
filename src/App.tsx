@@ -25,7 +25,8 @@ type Status =
 type ReadMode = 'auto' | 'ai'
 type Source = 'pdf' | 'ai'
 
-const ZOOM_STEPS = [0.6, 0.75, 0.9, 1, 1.25, 1.5, 2]
+/** 100% = ページ全体が画面に収まる大きさ */
+const ZOOM_STEPS = [0.6, 0.75, 0.9, 1, 1.25, 1.5, 2, 2.5, 3]
 const RATE_MIN = 0.6
 const RATE_MAX = 2
 
@@ -57,7 +58,9 @@ export default function App() {
   const [highlights, setHighlights] = useState<Box[]>([])
   const [marker, setMarker] = useState<{ x: number; y: number } | null>(null)
   const [dragging, setDragging] = useState(false)
-  const [viewerWidth, setViewerWidth] = useState(0)
+  const [viewerSize, setViewerSize] = useState({ width: 0, height: 0 })
+  /** 上の操作バーと下の読み取り欄を隠して、PDF を広く見せる */
+  const [chromeHidden, setChromeHidden] = useState(false)
 
   const viewerRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -86,11 +89,13 @@ export default function App() {
   }, [engine])
   useEffect(() => localStorage.setItem('mode', mode), [mode])
 
-  // 表示領域の幅に合わせてページを描くため、幅の変化を見張る
+  // 表示領域の大きさに合わせてページを描くため、大きさの変化を見張る
   useEffect(() => {
     const el = viewerRef.current
     if (!el) return
-    const ro = new ResizeObserver(([entry]) => setViewerWidth(entry.contentRect.width))
+    const ro = new ResizeObserver(([entry]) =>
+      setViewerSize({ width: entry.contentRect.width, height: entry.contentRect.height }),
+    )
     ro.observe(el)
     return () => ro.disconnect()
   }, [])
@@ -132,8 +137,12 @@ export default function App() {
     }
   }, [doc, pageNumber])
 
-  // ページを描く。横幅は「表示領域の幅 × 拡大率」、画素数は画面の解像度に合わせる
-  const cssWidth = Math.max(200, Math.floor((viewerWidth - 32) * ZOOM_STEPS[zoomIndex]))
+  // ページを描く。100% のときはページ全体が表示領域にちょうど収まる大きさ。画素数は画面の解像度に合わせる
+  const aspect = page ? pageAspect(page) : 1.414
+  const fitWidth = Math.min(viewerSize.width, viewerSize.height / aspect)
+  const cssWidth = Math.max(200, Math.floor(fitWidth * ZOOM_STEPS[zoomIndex]))
+  const cssHeight = Math.floor(cssWidth * aspect)
+  const viewerWidth = viewerSize.width
   useEffect(() => {
     const canvas = canvasRef.current
     if (!page || !canvas || viewerWidth === 0) return
@@ -220,9 +229,17 @@ export default function App() {
     [numPages, stop],
   )
 
-  // キーボード: ←→ でページ移動、Esc で読み上げを止める
+  // キーボード: スペースでメニューを出し入れ、←→ でページ移動、Esc で読み上げを止める
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLSelectElement) return
+      if (e.key === ' ' && !e.repeat) {
+        e.preventDefault()
+        // ボタンにフォーカスがあると、スペースでそのボタンも押されてしまうので外す
+        if (e.target instanceof HTMLElement) e.target.blur()
+        setChromeHidden((h) => !h)
+        return
+      }
       if (e.target instanceof HTMLInputElement) return
       if (e.key === 'ArrowLeft' || e.key === 'PageUp') goTo(pageNumber - 1)
       else if (e.key === 'ArrowRight' || e.key === 'PageDown') goTo(pageNumber + 1)
@@ -233,11 +250,10 @@ export default function App() {
   }, [goTo, pageNumber, stop])
 
   const busy = status.kind === 'reading' || status.kind === 'speaking'
-  const aspect = page ? pageAspect(page) : 1.414
 
   return (
     <div
-      className="app"
+      className={`app ${chromeHidden ? 'chrome-hidden' : ''}`}
       onDragOver={(e) => {
         e.preventDefault()
         setDragging(true)
@@ -250,156 +266,177 @@ export default function App() {
         if (file) void loadFile(file)
       }}
     >
-      <header className="toolbar">
-        <button type="button" className="btn primary" onClick={() => fileInputRef.current?.click()}>
-          PDFを開く
-        </button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="application/pdf,.pdf"
-          hidden
-          onChange={(e) => {
-            const file = e.target.files?.[0]
-            if (file) void loadFile(file)
-            e.target.value = ''
-          }}
-        />
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="application/pdf,.pdf"
+        hidden
+        onChange={(e) => {
+          const file = e.target.files?.[0]
+          if (file) void loadFile(file)
+          e.target.value = ''
+        }}
+      />
 
-        {doc && (
-          <>
-            <div className="group" role="group" aria-label="ページ">
-              <button type="button" className="btn" onClick={() => goTo(pageNumber - 1)} disabled={pageNumber <= 1}>
-                ◀ 前
-              </button>
-              <span className="page-count" aria-live="polite">
-                {pageNumber} / {numPages}
-              </span>
-              <button
-                type="button"
-                className="btn"
-                onClick={() => goTo(pageNumber + 1)}
-                disabled={pageNumber >= numPages}
-              >
-                次 ▶
-              </button>
-            </div>
+      {!chromeHidden && (
+        <header className="toolbar">
+          <button type="button" className="btn primary" onClick={() => fileInputRef.current?.click()}>
+            PDFを開く
+          </button>
 
-            <div className="group" role="group" aria-label="表示の大きさ">
-              <button
-                type="button"
-                className="btn"
-                aria-label="小さく表示"
-                onClick={() => setZoomIndex((i) => Math.max(0, i - 1))}
-                disabled={zoomIndex === 0}
-              >
-                －
-              </button>
-              <span className="zoom">{Math.round(ZOOM_STEPS[zoomIndex] * 100)}%</span>
-              <button
-                type="button"
-                className="btn"
-                aria-label="大きく表示"
-                onClick={() => setZoomIndex((i) => Math.min(ZOOM_STEPS.length - 1, i + 1))}
-                disabled={zoomIndex === ZOOM_STEPS.length - 1}
-              >
-                ＋
-              </button>
-            </div>
-          </>
-        )}
+          {doc && (
+            <>
+              <div className="group" role="group" aria-label="ページ">
+                <button type="button" className="btn" onClick={() => goTo(pageNumber - 1)} disabled={pageNumber <= 1}>
+                  ◀ 前
+                </button>
+                <span className="page-count" aria-live="polite">
+                  {pageNumber} / {numPages}
+                </span>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => goTo(pageNumber + 1)}
+                  disabled={pageNumber >= numPages}
+                >
+                  次 ▶
+                </button>
+              </div>
 
-        <div className="group" role="group" aria-label="読む範囲">
-          <button
-            type="button"
-            className={`btn toggle ${unit === 'block' ? 'on' : ''}`}
-            aria-pressed={unit === 'block'}
-            onClick={() => setUnit('block')}
-          >
-            まとまり
-          </button>
-          <button
-            type="button"
-            className={`btn toggle ${unit === 'line' ? 'on' : ''}`}
-            aria-pressed={unit === 'line'}
-            onClick={() => setUnit('line')}
-          >
-            1行
-          </button>
-        </div>
-
-        <div className="group" role="group" aria-label="読み取り方">
-          <button
-            type="button"
-            className={`btn toggle ${mode === 'auto' ? 'on' : ''}`}
-            aria-pressed={mode === 'auto'}
-            onClick={() => setMode('auto')}
-          >
-            自動
-          </button>
-          <button
-            type="button"
-            className={`btn toggle ${mode === 'ai' ? 'on' : ''}`}
-            aria-pressed={mode === 'ai'}
-            onClick={() => setMode('ai')}
-          >
-            AI
-          </button>
-        </div>
-
-        <div className="group" role="group" aria-label="声">
-          <button
-            type="button"
-            className={`btn toggle ${engine === 'browser' ? 'on' : ''}`}
-            aria-pressed={engine === 'browser'}
-            onClick={() => setEngine('browser')}
-          >
-            標準の声
-          </button>
-          <button
-            type="button"
-            className={`btn toggle ${engine === 'voicevox' ? 'on' : ''}`}
-            aria-pressed={engine === 'voicevox'}
-            onClick={() => setEngine('voicevox')}
-          >
-            VOICEVOX
-          </button>
-          {engine === 'voicevox' && styles.length > 0 && (
-            <select
-              className="select"
-              aria-label="VOICEVOX の話者"
-              value={speaker}
-              onChange={(e) => setSpeaker(Number(e.target.value))}
-            >
-              {styles.map((st) => (
-                <option key={st.id} value={st.id}>
-                  {st.speaker}（{st.style}）
-                </option>
-              ))}
-            </select>
+              <div className="group" role="group" aria-label="表示の大きさ">
+                <button
+                  type="button"
+                  className="btn"
+                  aria-label="小さく表示"
+                  onClick={() => setZoomIndex((i) => Math.max(0, i - 1))}
+                  disabled={zoomIndex === 0}
+                >
+                  －
+                </button>
+                <span className="zoom">{Math.round(ZOOM_STEPS[zoomIndex] * 100)}%</span>
+                <button
+                  type="button"
+                  className="btn"
+                  aria-label="大きく表示"
+                  onClick={() => setZoomIndex((i) => Math.min(ZOOM_STEPS.length - 1, i + 1))}
+                  disabled={zoomIndex === ZOOM_STEPS.length - 1}
+                >
+                  ＋
+                </button>
+              </div>
+            </>
           )}
-        </div>
 
-        <label className="rate">
-          <span>速さ {rate.toFixed(1)}</span>
-          <input
-            type="range"
-            min={RATE_MIN}
-            max={RATE_MAX}
-            step={0.1}
-            value={rate}
-            onChange={(e) => setRate(Number(e.target.value))}
-          />
-        </label>
-      </header>
+          <div className="group" role="group" aria-label="読む範囲">
+            <button
+              type="button"
+              className={`btn toggle ${unit === 'block' ? 'on' : ''}`}
+              aria-pressed={unit === 'block'}
+              onClick={() => setUnit('block')}
+            >
+              まとまり
+            </button>
+            <button
+              type="button"
+              className={`btn toggle ${unit === 'line' ? 'on' : ''}`}
+              aria-pressed={unit === 'line'}
+              onClick={() => setUnit('line')}
+            >
+              1行
+            </button>
+          </div>
+
+          <div className="group" role="group" aria-label="読み取り方">
+            <button
+              type="button"
+              className={`btn toggle ${mode === 'auto' ? 'on' : ''}`}
+              aria-pressed={mode === 'auto'}
+              onClick={() => setMode('auto')}
+            >
+              自動
+            </button>
+            <button
+              type="button"
+              className={`btn toggle ${mode === 'ai' ? 'on' : ''}`}
+              aria-pressed={mode === 'ai'}
+              onClick={() => setMode('ai')}
+            >
+              AI
+            </button>
+          </div>
+
+          <div className="group" role="group" aria-label="声">
+            <button
+              type="button"
+              className={`btn toggle ${engine === 'browser' ? 'on' : ''}`}
+              aria-pressed={engine === 'browser'}
+              onClick={() => setEngine('browser')}
+            >
+              標準の声
+            </button>
+            <button
+              type="button"
+              className={`btn toggle ${engine === 'voicevox' ? 'on' : ''}`}
+              aria-pressed={engine === 'voicevox'}
+              onClick={() => setEngine('voicevox')}
+            >
+              VOICEVOX
+            </button>
+            {engine === 'voicevox' && styles.length > 0 && (
+              <select
+                className="select"
+                aria-label="VOICEVOX の話者"
+                value={speaker}
+                onChange={(e) => setSpeaker(Number(e.target.value))}
+              >
+                {styles.map((st) => (
+                  <option key={st.id} value={st.id}>
+                    {st.speaker}（{st.style}）
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
+
+          <label className="rate">
+            <span>速さ {rate.toFixed(1)}</span>
+            <input
+              type="range"
+              min={RATE_MIN}
+              max={RATE_MAX}
+              step={0.1}
+              value={rate}
+              onChange={(e) => setRate(Number(e.target.value))}
+            />
+          </label>
+
+          <button type="button" className="btn hide-chrome" onClick={() => setChromeHidden(true)}>
+            隠す（スペース）
+          </button>
+        </header>
+      )}
+
+      {chromeHidden && (
+        <div className="floating">
+          {status.kind === 'error' && <span className="badge error">{status.message}</span>}
+          {busy && (
+            <button type="button" className="btn stop" onClick={stop}>
+              ■ 止める
+            </button>
+          )}
+          <button type="button" className="btn" onClick={() => setChromeHidden(false)}>
+            メニュー（スペース）
+          </button>
+        </div>
+      )}
 
       <main ref={viewerRef} className={`viewer ${dragging ? 'dragging' : ''}`}>
         {doc ? (
-          <div className="page" style={{ width: cssWidth, height: cssWidth * aspect }}>
+          <div className="page" style={{ width: cssWidth, height: cssHeight }}>
             <canvas
               ref={canvasRef}
               className="page-canvas"
-              style={{ width: cssWidth, height: cssWidth * aspect }}
+              style={{ width: cssWidth, height: cssHeight }}
               onClick={onPageClick}
               aria-label={`${fileName} の ${pageNumber} ページ目。読みたい場所をクリックしてください`}
             />
@@ -429,39 +466,42 @@ export default function App() {
             <p>講義資料のPDFを開いてください。</p>
             <p>ここにファイルを落としても開けます。</p>
             <p>開いたら、読みたい場所をクリック（タップ）すると読み上げます。</p>
+            <p>スペースキーで、上と下のメニューを隠して画面を広く使えます。</p>
           </div>
         )}
       </main>
 
-      <footer className="reader" aria-live="polite">
-        <div className="reader-status">
-          {status.kind === 'reading' && <span className="badge">読み取り中…</span>}
-          {status.kind === 'speaking' && <span className="badge speaking">読み上げ中</span>}
-          {status.kind === 'error' && <span className="badge error">{status.message}</span>}
-          {result && status.kind !== 'error' && status.kind !== 'reading' && (
-            <span className="badge source">
-              {result.source === 'pdf' ? 'PDFの文字' : 'AIで読み取り'}・{(result.ms / 1000).toFixed(1)}秒
-              {voiceMs !== null && `／声まで ${(voiceMs / 1000).toFixed(1)}秒`}
-            </span>
+      {!chromeHidden && (
+        <footer className="reader" aria-live="polite">
+          <div className="reader-status">
+            {status.kind === 'reading' && <span className="badge">読み取り中…</span>}
+            {status.kind === 'speaking' && <span className="badge speaking">読み上げ中</span>}
+            {status.kind === 'error' && <span className="badge error">{status.message}</span>}
+            {result && status.kind !== 'error' && status.kind !== 'reading' && (
+              <span className="badge source">
+                {result.source === 'pdf' ? 'PDFの文字' : 'AIで読み取り'}・{(result.ms / 1000).toFixed(1)}秒
+                {voiceMs !== null && `／声まで ${(voiceMs / 1000).toFixed(1)}秒`}
+              </span>
+            )}
+            {voiceNotice && <span className="badge error">{voiceNotice}</span>}
+            {!speechSupported && <span className="badge error">このブラウザは読み上げに対応していません</span>}
+          </div>
+          <p className="reader-text">{text || '読み取った文字がここに大きく表示されます。'}</p>
+          {engine === 'voicevox' && styles.length > 0 && (
+            <p className="credit">
+              音声：VOICEVOX:{styles.find((st) => st.id === speaker)?.speaker ?? ''}
+            </p>
           )}
-          {voiceNotice && <span className="badge error">{voiceNotice}</span>}
-          {!speechSupported && <span className="badge error">このブラウザは読み上げに対応していません</span>}
-        </div>
-        <p className="reader-text">{text || '読み取った文字がここに大きく表示されます。'}</p>
-        {engine === 'voicevox' && styles.length > 0 && (
-          <p className="credit">
-            音声：VOICEVOX:{styles.find((st) => st.id === speaker)?.speaker ?? ''}
-          </p>
-        )}
-        <div className="reader-actions">
-          <button type="button" className="btn" onClick={() => say(text)} disabled={!text || busy}>
-            もう一度
-          </button>
-          <button type="button" className="btn stop" onClick={stop} disabled={!busy}>
-            ■ 止める
-          </button>
-        </div>
-      </footer>
+          <div className="reader-actions">
+            <button type="button" className="btn" onClick={() => say(text)} disabled={!text || busy}>
+              もう一度
+            </button>
+            <button type="button" className="btn stop" onClick={stop} disabled={!busy}>
+              ■ 止める
+            </button>
+          </div>
+        </footer>
+      )}
     </div>
   )
 }

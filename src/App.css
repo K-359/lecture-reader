@@ -1,7 +1,32 @@
 .app {
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   height: 100dvh;
+}
+
+/* 上の操作バーと下の読み取り欄を隠したとき。PDF だけを画面いっぱいに出す */
+.app.chrome-hidden {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.hide-chrome {
+  margin-left: auto;
+}
+
+/* メニューを隠している間だけ右上に出す */
+.floating {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.floating .btn {
+  /* 白い PDF の上でも見分けがつくよう黒い縁を付ける */
+  box-shadow: 0 0 0 3px #000;
 }
 
 /* ---------- 上の操作バー ---------- */
@@ -89,8 +114,10 @@
 
 /* ---------- PDF の表示 ---------- */
 .viewer {
+  /* ページが小さいときは真ん中に、大きいときはスクロールで全部見られるよう flex + margin:auto で寄せる */
+  display: flex;
   overflow: auto;
-  padding: 16px;
+  padding: 8px;
   background: var(--bg);
 }
 
@@ -101,7 +128,8 @@
 
 .page {
   position: relative;
-  margin: 0 auto;
+  flex-shrink: 0;
+  margin: auto;
   background: #fff;
   box-shadow: 0 0 0 2px var(--surface-2);
 }
@@ -156,7 +184,7 @@
   display: grid;
   place-content: center;
   gap: 8px;
-  height: 100%;
+  margin: auto;
   font-size: 1.2rem;
   text-align: center;
 }
