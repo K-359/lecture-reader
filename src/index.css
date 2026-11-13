@@ -1,0 +1,37 @@
+:root {
+  --bg: #0b0b0f;
+  --surface: #1b1b22;
+  --surface-2: #2a2a34;
+  --text: #ffffff;
+  --muted: #d6d6de;
+  --accent: #ffd400;
+  --accent-text: #000000;
+  --danger: #ff6b6b;
+  --focus: #00e5ff;
+
+  font-family: 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'BIZ UDPGothic', 'Noto Sans JP', system-ui, sans-serif;
+  font-size: 22px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+  color-scheme: dark;
+  -webkit-font-smoothing: antialiased;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+}
+
+:focus-visible {
+  outline: 4px solid var(--focus);
+  outline-offset: 2px;
+}
