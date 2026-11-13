@@ -12,9 +12,20 @@ GlobalWorkerOptions.workerSrc = workerUrl
 
 export type { PDFDocumentProxy, PDFPageProxy }
 
+/** pdf.js が実行中に読むファイルの置き場所（vite.config.ts の pdfjsAssets で配っている） */
+const ASSETS = `${import.meta.env.BASE_URL}pdfjs/`
+
 export async function openPdf(file: File): Promise<PDFDocumentProxy> {
   const data = new Uint8Array(await file.arrayBuffer())
-  return getDocument({ data }).promise
+  return getDocument({
+    data,
+    // フォントを埋め込んでいない日本語の PDF は、文字の対応表（CMap）がないと文字が全部消える
+    cMapUrl: `${ASSETS}cmaps/`,
+    cMapPacked: true,
+    standardFontDataUrl: `${ASSETS}standard_fonts/`,
+    wasmUrl: `${ASSETS}wasm/`,
+    iccUrl: `${ASSETS}iccs/`,
+  }).promise
 }
 
 /** ページの縦横比（高さ / 幅） */
