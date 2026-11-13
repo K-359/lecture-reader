@@ -68,10 +68,11 @@ app.post('/api/tts', async (c) => {
   }
   try {
     const startedAt = Date.now()
-    const wav = await synthesize(text, speaker, speed)
+    const wav = await synthesize(text, speaker, speed, c.req.raw.signal)
     console.log(`[tts] ${Date.now() - startedAt}ms ${text.length}文字`)
     return c.body(wav, 200, { 'Content-Type': 'audio/wav' })
   } catch (error) {
+    if (c.req.raw.signal.aborted) return c.body(null, 204) // ブラウザ側が止めたので返す中身はない
     if (error instanceof VoicevoxUnavailableError) return c.json({ error: error.message }, 503)
     console.error('[tts] 音声の合成に失敗:', error)
     return c.json({ error: 'VOICEVOX で音声を作れませんでした。' }, 502)

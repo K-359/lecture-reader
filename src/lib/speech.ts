@@ -42,8 +42,31 @@ if (speechSupported) {
 
 // ---------- 共通 ----------
 
-/** 長い文を一度に渡すと途中で止まったり、最初の声が出るまで待たされたりするので、短く区切る */
-function splitText(text: string): string[] {
+/**
+ * 最初のかたまりを切ってよい助詞（は・が・を・に・で・も・と・の）。
+ * 「では」「ときに」のような言い回しの中で切らないよう、前後が漢字・カタカナ（後ろは数字も可）のところに限る。
+ * 例: 「エントロピーは｜情報量の…」「レポートの｜締め切りは…」
+ */
+const SPLIT_PARTICLE = /(?<=[\u4e00-\u9fff\u30a0-\u30ff])[はがをにでもとの](?=[\u4e00-\u9fff\u30a0-\u30ff0-9])/g
+
+/** 最初のかたまりを短くする。読点があればそこで、なければ助詞の後で切る */
+function splitFirstChunk(first: string): string[] {
+  if (first.length <= 8) return [first]
+  const comma = first.search(/[、，,]/)
+  if (comma >= 3 && comma < 20) return [first.slice(0, comma + 1), first.slice(comma + 1)]
+  for (const m of first.matchAll(SPLIT_PARTICLE)) {
+    const end = m.index + 1
+    if (end >= 4 && end <= 14) return [first.slice(0, end), first.slice(end)]
+  }
+  return [first]
+}
+
+/**
+ * 長い文を一度に渡すと途中で止まったり、最初の声が出るまで待たされたりするので、短く区切る。
+ * shortFirst: VOICEVOX 用。声が出るまでの時間は最初のかたまりの長さで決まり、
+ * 2つ目以降は再生中に合成できるので、最初だけさらに短く切る（ブラウザの声では不要な間ができるのでしない）
+ */
+function splitText(text: string, shortFirst: boolean): string[] {
   const sentences = text
     .split(/(?<=[。．！？!?])|\n+/)
     .map((s) => s.trim())
@@ -63,17 +86,13 @@ function splitText(text: string): string[] {
     if (buf) out.push(buf)
     return out
   })
-  // 声が出るまでの時間は最初のかたまりの長さで決まる。2つ目以降は再生中に合成するので、
-  // 最初だけは最初の読点で切って短くする（例:「エントロピーは、」）
-  const first = parts[0]
-  if (first && first.length > 14) {
-    const comma = first.search(/[、，,]/)
-    if (comma >= 3 && comma < 20) parts.splice(0, 1, first.slice(0, comma + 1), first.slice(comma + 1))
-  }
+  if (shortFirst && parts.length > 0) parts.splice(0, 1, ...splitFirstChunk(parts[0]))
   return parts.filter((p) => p.trim().length > 0)
 }
 
 let session = 0
+/** 読み上げを止めたら、まだ返ってきていない VOICEVOX への依頼も取り消す */
+let sessionAbort = new AbortController()
 let audioCtx: AudioContext | null = null
 let currentSource: AudioBufferSourceNode | null = null
 
@@ -102,6 +121,8 @@ export function unlockSpeech() {
 
 export function stopSpeech() {
   session++
+  sessionAbort.abort()
+  sessionAbort = new AbortController()
   if (speechSupported) speechSynthesis.cancel()
   currentSource?.stop()
   currentSource = null
@@ -109,7 +130,7 @@ export function stopSpeech() {
 
 export function speak(text: string, opts: SpeakOptions) {
   stopSpeech()
-  const parts = splitText(text)
+  const parts = splitText(text, opts.engine === 'voicevox')
   if (parts.length === 0) {
     opts.onEnd()
     return
@@ -143,7 +164,7 @@ const MAX_CACHE = 60
 const audioCache = new Map<string, Promise<AudioBuffer>>()
 
 /** 同じ文はもう一度合成しない（「もう一度」ボタンや、同じ場所を押し直したとき用） */
-function synthesizeCached(text: string, speaker: number, rate: number): Promise<AudioBuffer> {
+function synthesizeCached(text: string, speaker: number, rate: number, signal: AbortSignal): Promise<AudioBuffer> {
   const key = `${speaker}|${rate}|${text}`
   const hit = audioCache.get(key)
   if (hit) return hit
@@ -151,6 +172,7 @@ function synthesizeCached(text: string, speaker: number, rate: number): Promise<
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text, speaker, speed: rate }),
+    signal,
   })
     .then(async (res) => {
       if (!res.ok) {
@@ -183,7 +205,8 @@ function play(buffer: AudioBuffer): Promise<void> {
 async function speakVoicevox(parts: string[], opts: SpeakOptions, mySession: number) {
   // 今読んでいる文の再生中に、次の文を先に合成しておく
   const pending: (Promise<AudioBuffer> | undefined)[] = []
-  const get = (i: number) => (pending[i] ??= synthesizeCached(parts[i], opts.speaker, opts.rate))
+  const signal = sessionAbort.signal
+  const get = (i: number) => (pending[i] ??= synthesizeCached(parts[i], opts.speaker, opts.rate, signal))
 
   for (let i = 0; i < parts.length; i++) {
     let buffer: AudioBuffer

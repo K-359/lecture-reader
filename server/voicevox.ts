@@ -16,11 +16,13 @@ type SpeakerResponse = {
 
 export type VoicevoxStyle = { id: number; speaker: string; style: string }
 
-async function call(path: string, init?: RequestInit): Promise<Response> {
+async function call(path: string, init?: RequestInit, signal?: AbortSignal): Promise<Response> {
   let res: Response
+  const timeout = AbortSignal.timeout(15000)
   try {
-    res = await fetch(`${VOICEVOX_URL}${path}`, { ...init, signal: AbortSignal.timeout(15000) })
-  } catch {
+    res = await fetch(`${VOICEVOX_URL}${path}`, { ...init, signal: signal ? AbortSignal.any([signal, timeout]) : timeout })
+  } catch (e) {
+    if (signal?.aborted) throw e
     throw new VoicevoxUnavailableError(VOICEVOX_DOWN_MESSAGE)
   }
   if (!res.ok) throw new Error(`VOICEVOX ${path} が ${res.status} を返しました`)
@@ -37,10 +39,18 @@ export async function listStyles(): Promise<VoicevoxStyle[]> {
   )
 }
 
-/** 文章を WAV にする */
-export async function synthesize(text: string, speaker: number, speed: number): Promise<ArrayBuffer> {
+/** 文章を WAV にする。signal: ブラウザ側で読み上げを止めたら、VOICEVOX への依頼もやめる */
+export async function synthesize(
+  text: string,
+  speaker: number,
+  speed: number,
+  signal?: AbortSignal,
+): Promise<ArrayBuffer> {
   const params = new URLSearchParams({ text, speaker: String(speaker) })
-  const query = (await (await call(`/audio_query?${params}`, { method: 'POST' })).json()) as Record<string, unknown>
+  const query = (await (await call(`/audio_query?${params}`, { method: 'POST' }, signal)).json()) as Record<
+    string,
+    unknown
+  >
   query.speedScale = speed
   // 文の前後の無音を短くして、文と文の間の待ちを減らす（既定は 0.1 秒）
   query.prePhonemeLength = 0.05
@@ -49,6 +59,6 @@ export async function synthesize(text: string, speaker: number, speed: number): 
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(query),
-  })
+  }, signal)
   return wav.arrayBuffer()
 }
