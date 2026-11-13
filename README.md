@@ -58,4 +58,4 @@ VOICEVOX の声を使うときは、先に [VOICEVOX](https://voicevox.hiroshiba
 | `READER_EFFORT` | `low` | effort（`low` / `medium` / `high`） |
 | `READER_THINKING` | `off` | 思考の有無。思考を切れないモデル（`claude-opus-5-5` など）では `on` にする |
 | `PORT` | `8787` | API サーバーのポート |
-| `VOICEVOX_URL` | `http://localhost:50021` | VOICEVOX エンジンの URL |
+| `VOICEVOX_URL` | `http://127.0.0.1:50021` | VOICEVOX エンジンの URL |

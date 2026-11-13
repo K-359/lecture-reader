@@ -1,9 +1,9 @@
 /**
- * VOICEVOX エンジン（既定は http://localhost:50021）への中継。
+ * VOICEVOX エンジン（既定は http://127.0.0.1:50021）への中継。
  * ブラウザから直接つながず API サーバーを通すことで、タブレットからでも PC の VOICEVOX を使える。
  */
 
-const VOICEVOX_URL = (process.env.VOICEVOX_URL ?? 'http://localhost:50021').replace(/\/$/, '')
+const VOICEVOX_URL = (process.env.VOICEVOX_URL ?? 'http://127.0.0.1:50021').replace(/\/$/, '')
 
 export const VOICEVOX_DOWN_MESSAGE = 'VOICEVOX につながりません。VOICEVOX を起動してください。'
 
@@ -32,7 +32,7 @@ export async function listStyles(): Promise<VoicevoxStyle[]> {
   const speakers = (await (await call('/speakers')).json()) as SpeakerResponse
   return speakers.flatMap((sp) =>
     sp.styles
-      .filter((st) => st.type === undefined || st.type === 'talk')
+      .filter((st) => (st.type ?? 'talk').includes('talk')) // talk / streaming_talk。歌唱用は除く
       .map((st) => ({ id: st.id, speaker: sp.name, style: st.name })),
   )
 }

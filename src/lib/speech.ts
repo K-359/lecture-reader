@@ -48,21 +48,29 @@ function splitText(text: string): string[] {
     .split(/(?<=[。．！？!?])|\n+/)
     .map((s) => s.trim())
     .filter((s) => s.length > 0)
-  // 長い文は読点で区切る（VOICEVOX で最初の声を早く出すため）
-  return sentences.flatMap((s) => {
+  // 長い文は読点で区切る（VOICEVOX は合成に1文字あたり約50ミリ秒かかるため）
+  const parts = sentences.flatMap((s) => {
     if (s.length <= 40) return [s]
-    const parts: string[] = []
+    const out: string[] = []
     let buf = ''
     for (const piece of s.split(/(?<=[、，,])/)) {
       if (buf && buf.length + piece.length > 40) {
-        parts.push(buf)
+        out.push(buf)
         buf = ''
       }
       buf += piece
     }
-    if (buf) parts.push(buf)
-    return parts
+    if (buf) out.push(buf)
+    return out
   })
+  // 声が出るまでの時間は最初のかたまりの長さで決まる。2つ目以降は再生中に合成するので、
+  // 最初だけは最初の読点で切って短くする（例:「エントロピーは、」）
+  const first = parts[0]
+  if (first && first.length > 14) {
+    const comma = first.search(/[、，,]/)
+    if (comma >= 3 && comma < 20) parts.splice(0, 1, first.slice(0, comma + 1), first.slice(comma + 1))
+  }
+  return parts.filter((p) => p.trim().length > 0)
 }
 
 let session = 0
