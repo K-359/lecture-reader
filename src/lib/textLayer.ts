@@ -119,6 +119,15 @@ function getLines(page: PDFPageProxy) {
   return p
 }
 
+/**
+ * ページに文字データがあるか。ある（スキャンではない）のにクリック位置に文字がなければ、
+ * そこは図の上だと考えられる
+ */
+export async function pageHasText(page: PDFPageProxy): Promise<boolean> {
+  const { lines } = await getLines(page)
+  return lines.length > 0
+}
+
 /** ページを開いたときに先に文字データを読んでおき、最初のクリックを速くする */
 export function prefetchText(page: PDFPageProxy) {
   void getLines(page).catch(() => undefined)

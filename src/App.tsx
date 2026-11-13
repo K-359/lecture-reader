@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react'
-import { readAt, type ReadUnit } from './lib/api'
-import { captureAround } from './lib/capture'
+import { useCallback, useEffect, useRef, useState, type MouseEvent, type PointerEvent } from 'react'
+import { explainAt, readAt, type ExplainTarget, type ReadUnit } from './lib/api'
+import { captureAround, captureRegion } from './lib/capture'
 import { isCancelled, openPdf, pageAspect, renderPage, type PDFDocumentProxy, type PDFPageProxy } from './lib/pdf'
 import {
   fetchVoicevoxStyles,
@@ -12,7 +12,7 @@ import {
   type VoicevoxStyle,
 } from './lib/speech'
 import { toSpeakable } from './lib/speechText'
-import { findTextAt, prefetchText, type Box } from './lib/textLayer'
+import { findTextAt, pageHasText, prefetchText, type Box } from './lib/textLayer'
 import './App.css'
 
 type Status =
@@ -23,7 +23,36 @@ type Status =
 
 /** auto: PDF の文字データを先に使い、取れなかったときだけ VLM。ai: いつも VLM */
 type ReadMode = 'auto' | 'ai'
-type Source = 'pdf' | 'ai'
+type Source = 'pdf' | 'ai' | 'figure'
+/** クリックで読む範囲。figure: クリックした場所にある図を説明する */
+type PickUnit = ReadUnit | 'figure'
+
+/** 説明した図。同じ図をもう一度押すか「くわしく」で detail を読む */
+type Figure = { pageNumber: number; box: Box | null; summary: string; detail: string; showing: 'summary' | 'detail' }
+
+/** これより動かしたらクリックではなく範囲選択とみなす（CSS ピクセル） */
+const DRAG_THRESHOLD = 10
+
+function inside(b: Box, x: number, y: number) {
+  return x >= b.left && x <= b.right && y >= b.top && y <= b.bottom
+}
+
+/** 2点を対角とする範囲（ページに対する 0〜1 の割合） */
+function boxFrom(rect: DOMRect, x0: number, y0: number, x1: number, y1: number): Box {
+  const nx = (v: number) => Math.min(1, Math.max(0, (v - rect.left) / rect.width))
+  const ny = (v: number) => Math.min(1, Math.max(0, (v - rect.top) / rect.height))
+  return {
+    left: Math.min(nx(x0), nx(x1)),
+    right: Math.max(nx(x0), nx(x1)),
+    top: Math.min(ny(y0), ny(y1)),
+    bottom: Math.max(ny(y0), ny(y1)),
+  }
+}
+
+function loadUnit(): PickUnit {
+  const v = localStorage.getItem('unit')
+  return v === 'line' || v === 'figure' ? v : 'block'
+}
 
 /** 100% = ページ全体が画面に収まる大きさ */
 const ZOOM_STEPS = [0.6, 0.75, 0.9, 1, 1.25, 1.5, 2, 2.5, 3]
@@ -41,7 +70,7 @@ export default function App() {
   const [pageNumber, setPageNumber] = useState(1)
   const [page, setPage] = useState<PDFPageProxy | null>(null)
   const [zoomIndex, setZoomIndex] = useState(3)
-  const [unit, setUnit] = useState<ReadUnit>(() => (localStorage.getItem('unit') === 'line' ? 'line' : 'block'))
+  const [unit, setUnit] = useState<PickUnit>(loadUnit)
   const [rate, setRate] = useState(() => loadNumber('rate', 1))
   const [status, setStatus] = useState<Status>({ kind: 'idle' })
   const [text, setText] = useState('')
@@ -57,6 +86,9 @@ export default function App() {
   const [voiceNotice, setVoiceNotice] = useState('')
   const [highlights, setHighlights] = useState<Box[]>([])
   const [marker, setMarker] = useState<{ x: number; y: number } | null>(null)
+  const [figure, setFigure] = useState<Figure | null>(null)
+  /** ドラッグで選んでいる範囲 */
+  const [selection, setSelection] = useState<Box | null>(null)
   const [dragging, setDragging] = useState(false)
   const [viewerSize, setViewerSize] = useState({ width: 0, height: 0 })
   /** 上の操作バーと下の読み取り欄を隠して、PDF を広く見せる */
@@ -66,6 +98,9 @@ export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const dragRef = useRef<{ id: number; x0: number; y0: number; active: boolean } | null>(null)
+  /** ドラッグを終えた直後の click は、クリックとして扱わない */
+  const suppressClickRef = useRef(false)
 
   useEffect(() => localStorage.setItem('unit', unit), [unit])
   useEffect(() => localStorage.setItem('rate', String(rate)), [rate])
@@ -115,6 +150,8 @@ export default function App() {
       setPageNumber(1)
       setMarker(null)
       setHighlights([])
+      setFigure(null)
+      setSelection(null)
       setResult(null)
       setText('')
       setStatus({ kind: 'idle' })
@@ -163,6 +200,7 @@ export default function App() {
     (t: string, startedAt = performance.now()) => {
       setStatus({ kind: 'speaking' })
       setVoiceMs(null)
+      setVoiceNotice('')
       speak(toSpeakable(t), {
         engine,
         rate,
@@ -175,45 +213,147 @@ export default function App() {
     [engine, rate, speaker],
   )
 
-  const onPageClick = async (e: MouseEvent<HTMLCanvasElement>) => {
-    if (!page) return
+  /** 前の読み取りと読み上げを止めて、新しい読み取りを始める */
+  const begin = () => {
     unlockSpeech()
-    const rect = e.currentTarget.getBoundingClientRect()
-    const x = (e.clientX - rect.left) / rect.width
-    const y = (e.clientY - rect.top) / rect.height
-
     abortRef.current?.abort()
     stopSpeech()
     const controller = new AbortController()
     abortRef.current = controller
-
-    setMarker({ x, y })
-    setHighlights([])
     setVoiceMs(null)
     setStatus({ kind: 'reading' })
-    const startedAt = performance.now()
+    return { controller, startedAt: performance.now() }
+  }
+
+  const fail = (controller: AbortController, err: unknown) => {
+    if (controller.signal.aborted) return
+    setStatus({ kind: 'error', message: err instanceof Error ? err.message : '読み取りに失敗しました。' })
+  }
+
+  /** 図を説明させ、まずひとこと（summary）を読む */
+  const explain = async (p: PDFPageProxy, target: ExplainTarget, controller: AbortController, startedAt: number) => {
+    const images = target.type === 'point' ? await captureAround(p, target.x, target.y) : await captureRegion(p, target)
+    const ex = await explainAt(images, target, controller.signal)
+    if (controller.signal.aborted) return
+    setFigure(ex.detail ? { pageNumber, box: ex.bbox, summary: ex.summary, detail: ex.detail, showing: 'summary' } : null)
+    setSelection(null)
+    setHighlights(ex.bbox ? [ex.bbox] : [])
+    setText(ex.summary)
+    setResult({ source: 'figure', ms: performance.now() - startedAt })
+    say(ex.summary, startedAt)
+  }
+
+  /** 説明した図の、くわしい説明を読む */
+  const showDetail = (f: Figure, startedAt = performance.now()) => {
+    setFigure({ ...f, showing: 'detail' })
+    setMarker(null)
+    setSelection(null)
+    setHighlights(f.box ? [f.box] : [])
+    setText(f.detail)
+    say(f.detail, startedAt)
+  }
+
+  const onDetailButton = () => {
+    if (!figure) return
+    unlockSpeech()
+    abortRef.current?.abort()
+    showDetail(figure)
+  }
+
+  const onPageClick = async (e: MouseEvent<HTMLCanvasElement>) => {
+    if (!page) return
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false
+      return
+    }
+    const rect = e.currentTarget.getBoundingClientRect()
+    const x = (e.clientX - rect.left) / rect.width
+    const y = (e.clientY - rect.top) / rect.height
+
+    const { controller, startedAt } = begin()
+    setMarker({ x, y })
+    setHighlights([])
+    setSelection(null)
     try {
       // まず PDF の文字データから探す（一瞬で返る）
-      const hit = mode === 'auto' ? await findTextAt(page, x, y, unit).catch(() => null) : null
-      if (controller.signal.aborted) return
-      if (hit) {
-        setText(hit.text)
-        setHighlights(hit.boxes)
-        setResult({ source: 'pdf', ms: performance.now() - startedAt })
-        say(hit.text, startedAt)
+      if (unit !== 'figure' && mode === 'auto') {
+        const hit = await findTextAt(page, x, y, unit).catch(() => null)
+        if (controller.signal.aborted) return
+        if (hit) {
+          setFigure(null)
+          setText(hit.text)
+          setHighlights(hit.boxes)
+          setResult({ source: 'pdf', ms: performance.now() - startedAt })
+          say(hit.text, startedAt)
+          return
+        }
+      }
+      // 説明したばかりの図をもう一度押したら、くわしい説明を読む
+      if (figure?.pageNumber === pageNumber && figure.showing === 'summary' && figure.box && inside(figure.box, x, y)) {
+        showDetail(figure, startedAt)
         return
       }
-      // 文字データがない・図の上・AI を選んだとき は VLM で読み取る
-      const images = await captureAround(page, x, y)
-      const read = await readAt(images, x, y, unit, controller.signal)
+      // 「図」を選んだとき、または文字データのあるページで文字のない場所（＝図の上）を押したときは、図を説明する
+      const onFigure = unit === 'figure' || (mode === 'auto' && (await pageHasText(page).catch(() => false)))
       if (controller.signal.aborted) return
+      if (onFigure) {
+        await explain(page, { type: 'point', x, y }, controller, startedAt)
+        return
+      }
+      // 文字データがない（スキャンした）PDF や、AI を選んだときは VLM で書き起こす
+      const images = await captureAround(page, x, y)
+      const read = await readAt(images, x, y, unit === 'line' ? 'line' : 'block', controller.signal)
+      if (controller.signal.aborted) return
+      setFigure(null)
       setText(read)
       setResult({ source: 'ai', ms: performance.now() - startedAt })
       say(read, startedAt)
     } catch (err) {
-      if (controller.signal.aborted) return
-      setStatus({ kind: 'error', message: err instanceof Error ? err.message : '読み取りに失敗しました。' })
+      fail(controller, err)
     }
+  }
+
+  // ---------- ドラッグで範囲を選ぶ ----------
+  // マウスはいつでも。タッチはドラッグがスクロールと重なるので「図」を選んでいるときだけ
+
+  const onPointerDown = (e: PointerEvent<HTMLCanvasElement>) => {
+    suppressClickRef.current = false
+    if (!page || e.button !== 0) return
+    if (e.pointerType !== 'mouse' && unit !== 'figure') return
+    dragRef.current = { id: e.pointerId, x0: e.clientX, y0: e.clientY, active: false }
+  }
+
+  const onPointerMove = (e: PointerEvent<HTMLCanvasElement>) => {
+    const d = dragRef.current
+    if (!d || d.id !== e.pointerId) return
+    if (!d.active) {
+      if (Math.hypot(e.clientX - d.x0, e.clientY - d.y0) < DRAG_THRESHOLD) return
+      d.active = true
+      e.currentTarget.setPointerCapture(e.pointerId)
+      setMarker(null)
+      setHighlights([])
+    }
+    setSelection(boxFrom(e.currentTarget.getBoundingClientRect(), d.x0, d.y0, e.clientX, e.clientY))
+  }
+
+  const onPointerUp = async (e: PointerEvent<HTMLCanvasElement>) => {
+    const d = dragRef.current
+    dragRef.current = null
+    if (!page || !d?.active || d.id !== e.pointerId) return
+    suppressClickRef.current = true
+    const box = boxFrom(e.currentTarget.getBoundingClientRect(), d.x0, d.y0, e.clientX, e.clientY)
+    setSelection(box)
+    const { controller, startedAt } = begin()
+    try {
+      await explain(page, { type: 'rect', ...box }, controller, startedAt)
+    } catch (err) {
+      fail(controller, err)
+    }
+  }
+
+  const onPointerCancel = () => {
+    if (dragRef.current?.active) setSelection(null)
+    dragRef.current = null
   }
 
   const numPages = doc?.numPages ?? 0
@@ -223,6 +363,8 @@ export default function App() {
       stop()
       setMarker(null)
       setHighlights([])
+      setFigure(null)
+      setSelection(null)
       setPageNumber(n)
       viewerRef.current?.scrollTo({ top: 0 })
     },
@@ -344,6 +486,14 @@ export default function App() {
             >
               1行
             </button>
+            <button
+              type="button"
+              className={`btn toggle ${unit === 'figure' ? 'on' : ''}`}
+              aria-pressed={unit === 'figure'}
+              onClick={() => setUnit('figure')}
+            >
+              図
+            </button>
           </div>
 
           <div className="group" role="group" aria-label="読み取り方">
@@ -419,6 +569,11 @@ export default function App() {
       {chromeHidden && (
         <div className="floating">
           {status.kind === 'error' && <span className="badge error">{status.message}</span>}
+          {figure?.showing === 'summary' && (
+            <button type="button" className="btn" onClick={onDetailButton}>
+              くわしく
+            </button>
+          )}
           {busy && (
             <button type="button" className="btn stop" onClick={stop}>
               ■ 止める
@@ -435,9 +590,13 @@ export default function App() {
           <div className="page" style={{ width: cssWidth, height: cssHeight }}>
             <canvas
               ref={canvasRef}
-              className="page-canvas"
+              className={`page-canvas ${unit === 'figure' ? 'figure-mode' : ''}`}
               style={{ width: cssWidth, height: cssHeight }}
               onClick={onPageClick}
+              onPointerDown={onPointerDown}
+              onPointerMove={onPointerMove}
+              onPointerUp={onPointerUp}
+              onPointerCancel={onPointerCancel}
               aria-label={`${fileName} の ${pageNumber} ページ目。読みたい場所をクリックしてください`}
             />
             {highlights.map((b, i) => (
@@ -453,7 +612,19 @@ export default function App() {
                 aria-hidden="true"
               />
             ))}
-            {marker && highlights.length === 0 && (
+            {selection && (
+              <div
+                className={`selection ${status.kind === 'reading' ? 'pulse' : ''}`}
+                style={{
+                  left: `${selection.left * 100}%`,
+                  top: `${selection.top * 100}%`,
+                  width: `${(selection.right - selection.left) * 100}%`,
+                  height: `${(selection.bottom - selection.top) * 100}%`,
+                }}
+                aria-hidden="true"
+              />
+            )}
+            {marker && highlights.length === 0 && !selection && (
               <div
                 className={`marker ${status.kind === 'reading' ? 'pulse' : ''}`}
                 style={{ left: `${marker.x * 100}%`, top: `${marker.y * 100}%` }}
@@ -466,6 +637,7 @@ export default function App() {
             <p>講義資料のPDFを開いてください。</p>
             <p>ここにファイルを落としても開けます。</p>
             <p>開いたら、読みたい場所をクリック（タップ）すると読み上げます。</p>
+            <p>図の説明を聞くには「図」を選んでクリックするか、説明してほしい所をドラッグで囲みます。</p>
             <p>スペースキーで、上と下のメニューを隠して画面を広く使えます。</p>
           </div>
         )}
@@ -479,7 +651,7 @@ export default function App() {
             {status.kind === 'error' && <span className="badge error">{status.message}</span>}
             {result && status.kind !== 'error' && status.kind !== 'reading' && (
               <span className="badge source">
-                {result.source === 'pdf' ? 'PDFの文字' : 'AIで読み取り'}・{(result.ms / 1000).toFixed(1)}秒
+                {result.source === 'pdf' ? 'PDFの文字' : result.source === 'figure' ? 'AIで図を説明' : 'AIで読み取り'}・{(result.ms / 1000).toFixed(1)}秒
                 {voiceMs !== null && `／声まで ${(voiceMs / 1000).toFixed(1)}秒`}
               </span>
             )}
@@ -493,6 +665,11 @@ export default function App() {
             </p>
           )}
           <div className="reader-actions">
+            {figure?.showing === 'summary' && (
+              <button type="button" className="btn primary" onClick={onDetailButton}>
+                くわしく
+              </button>
+            )}
             <button type="button" className="btn" onClick={() => say(text)} disabled={!text || busy}>
               もう一度
             </button>

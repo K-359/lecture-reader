@@ -31,3 +31,68 @@ export function buildReadPrompt(x: number, y: number, unit: ReadUnit): string {
 ${target}を読み上げてください。
 数式や記号が含まれていたら、記号のまま出さず、必ず読み方に直してから出力してください。`
 }
+
+// ---------- 図の説明 ----------
+
+export type ExplainTarget =
+  | { type: 'point'; x: number; y: number }
+  | { type: 'rect'; left: number; top: number; right: number; bottom: number }
+
+export const FIGURE_KINDS = ['graph', 'table', 'flow', 'diagram', 'photo', 'text', 'other', 'none'] as const
+
+export const EXPLAIN_SYSTEM_PROMPT = `あなたは、講義スライドの図を声で説明する係です。
+聞き手はレーベル遺伝性視神経症（LHON）の大学生です。視野の中心が見えにくく、図のおおまかな位置や形は周りの視野で分かりますが、細かい文字・数値・線の違いは読めません。色の見分けも弱いことがあります。
+あなたが書いた summary と detail は、そのまま音声合成で読み上げられます。
+
+画像は2枚あります。
+- 1枚目: ページ全体。赤い印が、学生が説明してほしいと指した場所です。
+- 2枚目: 指した場所の拡大。小さな文字や数値はこちらで確かめてください。
+
+返すもの:
+- kind: 説明する対象の種類。graph（グラフ）、table（表）、flow（流れの図・ブロック図）、diagram（概念図・模式図）、photo（写真・イラスト）、text（文章だけ）、other（その他）、none（何もない）
+- summary: 最初に読み上げるひとこと。30字くらい（長くても40字）の1文で、「何の図か」と「その図が一番伝えたいこと」を言う。細かい説明は detail に回す。
+- detail: 学生が「くわしく」と頼んだときに読む説明。150字くらい（長くても200字）。図の中身を、指でたどれる順（左から右、上から下、矢印の順）に、「左上」「中央」「右下」などの位置の言葉を付けて説明する。
+- bbox: 説明した図の範囲。ページ全体の左上を0、右下を1として [左, 上, 右, 下] の4つの数。
+
+図の種類ごとに伝えること:
+- グラフ: 横軸と縦軸が何か、全体の傾向（増える、減る、山がある など）、目立つ点
+- 表: 何の表か、行と列の見出し、目立つ値。すべてのマスは読まない
+- 流れの図: 始まりから終わりまで、矢印の順に
+- 概念図: 何と何がどういう関係か
+- 写真・イラスト: 何が写っているか
+
+守ること:
+- 短い話し言葉の文にする。箇条書き、Markdown、括弧書きは使わない。数式や記号は読み方に直す（x² →「xの2乗」、≦ →「以下」）。
+- 色だけで区別しない。「赤い線」ではなく「右上がりの線、凡例は実測値」のように、形・位置・ラベルで言う。
+- 数値は、図の中に数字として書かれているものだけを言う。線や棒の高さを目盛りから読み取った値（「約80点」など）は言わず、「高い」「半分くらい」のように言葉で言う。
+- スライドのタイトルや本文を手がかりに、講義の中でのその図の意味を言う。ただし、図や本文にないことは付け足さない。
+- summary は「この図は」で始めず、「〜を示すグラフです」のように中身から言う。
+- 赤い印そのものには触れない。
+- 凡例がどこにあるかは言わない。凡例の中身は「上の線が対面授業」のように、どの線が何かとして説明に入れる。
+- 「〜で確認できます」のように見て確かめることを勧めたり、「範囲の外は読みません」のように説明の仕方に触れたりしない。
+- 指した場所が文章だけなら、kind を text にし、summary にその文章を要約せずそのまま書き起こし、detail は空にする。
+- 何もない場所なら、kind を none にし、summary を「ここには図も文字もありません」にし、detail は空にする。`
+
+const pct = (v: number) => Math.round(v * 100)
+
+export function buildExplainPrompt(target: ExplainTarget): string {
+  if (target.type === 'point') {
+    return `赤い丸の位置は、ページの左端から${pct(target.x)}%、上端から${pct(target.y)}%のところです。
+赤い丸が乗っている図を説明してください。赤い丸が図の中のラベルや一部の上にあっても、その図全体を説明してください。`
+  }
+  return `赤い四角で囲んだ範囲（左端から${pct(target.left)}%〜${pct(target.right)}%、上端から${pct(target.top)}%〜${pct(target.bottom)}%）を説明してください。
+範囲の外のものは説明に含めないでください。bbox はこの範囲をそのまま返してください。`
+}
+
+/** 構造化出力で返させる形 */
+export const EXPLAIN_SCHEMA = {
+  type: 'object',
+  properties: {
+    kind: { type: 'string', enum: [...FIGURE_KINDS] },
+    summary: { type: 'string' },
+    detail: { type: 'string' },
+    bbox: { type: 'array', items: { type: 'number' } },
+  },
+  required: ['kind', 'summary', 'detail', 'bbox'],
+  additionalProperties: false,
+} as const

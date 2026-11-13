@@ -2,7 +2,16 @@ import Anthropic from '@anthropic-ai/sdk'
 import { serve } from '@hono/node-server'
 import { config } from 'dotenv'
 import { Hono } from 'hono'
-import { buildReadPrompt, SYSTEM_PROMPT, type ReadUnit } from './prompt.ts'
+import {
+  buildExplainPrompt,
+  buildReadPrompt,
+  EXPLAIN_SCHEMA,
+  EXPLAIN_SYSTEM_PROMPT,
+  FIGURE_KINDS,
+  SYSTEM_PROMPT,
+  type ExplainTarget,
+  type ReadUnit,
+} from './prompt.ts'
 import { listStyles, synthesize, VoicevoxUnavailableError } from './voicevox.ts'
 
 // .env の値を、起動元のシェルから引き継いだ環境変数より優先する
@@ -99,14 +108,8 @@ app.post('/api/read', async (c) => {
         {
           role: 'user',
           content: [
-            {
-              type: 'image',
-              source: { type: 'base64', media_type: 'image/jpeg', data: body.pageImage },
-            },
-            {
-              type: 'image',
-              source: { type: 'base64', media_type: 'image/jpeg', data: body.detailImage },
-            },
+            imageBlock(body.pageImage),
+            imageBlock(body.detailImage),
             { type: 'text', text: buildReadPrompt(body.x, body.y, body.unit) },
           ],
         },
@@ -127,23 +130,128 @@ app.post('/api/read', async (c) => {
     )
     return c.json({ text })
   } catch (error) {
-    if (error instanceof Anthropic.AuthenticationError) {
-      console.error('[read] 認証エラー:', error.message)
-      return c.json({ error: 'APIキーが設定されていないか、正しくありません。' }, 500)
+    return c.json(...apiErrorResponse('read', error))
+  }
+})
+
+/** Claude API のエラーを、画面に出す日本語のメッセージと HTTP の状態コードにする */
+function apiErrorResponse(tag: string, error: unknown): [{ error: string }, 429 | 500 | 502] {
+  if (error instanceof Anthropic.AuthenticationError) {
+    console.error(`[${tag}] 認証エラー:`, error.message)
+    return [{ error: 'APIキーが設定されていないか、正しくありません。' }, 500]
+  }
+  if (error instanceof Anthropic.RateLimitError) {
+    return [{ error: '混み合っています。少し待ってからもう一度押してください。' }, 429]
+  }
+  if (error instanceof Anthropic.APIError) {
+    console.error(`[${tag}] APIエラー ${error.status}:`, error.message)
+    return [{ error: '読み取りに失敗しました。' }, 502]
+  }
+  if (!hasCredentials) {
+    console.error(`[${tag}] ${NO_KEY_MESSAGE}`)
+    return [{ error: NO_KEY_MESSAGE }, 500]
+  }
+  console.error(`[${tag}] 予期しないエラー:`, error)
+  return [{ error: '読み取りに失敗しました。' }, 500]
+}
+
+function imageBlock(data: string): Anthropic.ImageBlockParam {
+  return { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } }
+}
+
+// ---------- 図の説明 ----------
+
+type ExplainRequest = { pageImage: string; detailImage: string; target: ExplainTarget }
+
+const isUnit = (v: unknown): v is number => typeof v === 'number' && v >= 0 && v <= 1
+
+function isExplainTarget(t: unknown): t is ExplainTarget {
+  if (typeof t !== 'object' || t === null) return false
+  const o = t as Record<string, unknown>
+  if (o.type === 'point') return isUnit(o.x) && isUnit(o.y)
+  if (o.type === 'rect') {
+    return isUnit(o.left) && isUnit(o.top) && isUnit(o.right) && isUnit(o.bottom) && o.left < o.right && o.top < o.bottom
+  }
+  return false
+}
+
+function isExplainRequest(body: unknown): body is ExplainRequest {
+  if (typeof body !== 'object' || body === null) return false
+  const b = body as Record<string, unknown>
+  return typeof b.pageImage === 'string' && typeof b.detailImage === 'string' && isExplainTarget(b.target)
+}
+
+type Explanation = {
+  kind: (typeof FIGURE_KINDS)[number]
+  summary: string
+  detail: string
+  bbox: { left: number; top: number; right: number; bottom: number } | null
+}
+
+/** モデルの返した JSON を確かめて整える。範囲がおかしければ null にする */
+function toExplanation(raw: unknown, target: ExplainTarget): Explanation | null {
+  if (typeof raw !== 'object' || raw === null) return null
+  const r = raw as Record<string, unknown>
+  if (typeof r.summary !== 'string' || typeof r.detail !== 'string') return null
+  const kind = FIGURE_KINDS.find((k) => k === r.kind) ?? 'other'
+  let bbox: Explanation['bbox'] = null
+  if (target.type === 'rect') {
+    // 範囲を選んだときは、選んだ範囲をそのまま枠にする
+    bbox = { left: target.left, top: target.top, right: target.right, bottom: target.bottom }
+  } else if (Array.isArray(r.bbox) && r.bbox.length === 4 && r.bbox.every((v) => typeof v === 'number')) {
+    const [l, t, rt, b] = (r.bbox as number[]).map((v) => Math.min(1, Math.max(0, v)))
+    if (rt - l > 0.02 && b - t > 0.02) bbox = { left: l, top: t, right: rt, bottom: b }
+  }
+  return { kind, summary: r.summary.trim(), detail: r.detail.trim(), bbox }
+}
+
+app.post('/api/explain', async (c) => {
+  const body: unknown = await c.req.json().catch(() => null)
+  if (!isExplainRequest(body)) {
+    return c.json({ error: 'リクエストの形式が正しくありません。' }, 400)
+  }
+
+  const startedAt = Date.now()
+  try {
+    const response = await client.messages.create({
+      model: MODEL,
+      max_tokens: 4000,
+      thinking: THINKING_ON ? { type: 'adaptive' } : { type: 'disabled' },
+      output_config: { effort: EFFORT, format: { type: 'json_schema', schema: EXPLAIN_SCHEMA } },
+      system: EXPLAIN_SYSTEM_PROMPT,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            imageBlock(body.pageImage),
+            imageBlock(body.detailImage),
+            { type: 'text', text: buildExplainPrompt(body.target) },
+          ],
+        },
+      ],
+    })
+
+    if (response.stop_reason === 'refusal') {
+      return c.json({ error: 'この部分は説明できませんでした。' }, 422)
     }
-    if (error instanceof Anthropic.RateLimitError) {
-      return c.json({ error: '混み合っています。少し待ってからもう一度押してください。' }, 429)
+    const json = response.content.flatMap((block) => (block.type === 'text' ? [block.text] : [])).join('')
+    let parsed: unknown = null
+    try {
+      parsed = JSON.parse(json)
+    } catch {
+      // max_tokens で途切れたときなど
     }
-    if (error instanceof Anthropic.APIError) {
-      console.error(`[read] APIエラー ${error.status}:`, error.message)
-      return c.json({ error: '読み取りに失敗しました。' }, 502)
+    const explanation = toExplanation(parsed, body.target)
+    console.log(
+      `[explain] ${Date.now() - startedAt}ms ${body.target.type} model=${response.model} in=${response.usage.input_tokens} out=${response.usage.output_tokens}`,
+    )
+    if (!explanation) {
+      console.error('[explain] 返事の形が正しくありません:', json.slice(0, 200))
+      return c.json({ error: '図の説明を作れませんでした。' }, 502)
     }
-    if (!hasCredentials) {
-      console.error(`[read] ${NO_KEY_MESSAGE}`)
-      return c.json({ error: NO_KEY_MESSAGE }, 500)
-    }
-    console.error('[read] 予期しないエラー:', error)
-    return c.json({ error: '読み取りに失敗しました。' }, 500)
+    return c.json(explanation)
+  } catch (error) {
+    return c.json(...apiErrorResponse('explain', error))
   }
 })
 

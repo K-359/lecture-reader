@@ -1,4 +1,5 @@
 import { renderPage, type PDFPageProxy } from './pdf'
+import type { Box } from './textLayer'
 
 /** VLM に送るために高解像度で描くときのページの横幅（ピクセル） */
 const HI_RES_WIDTH = 2400
@@ -42,6 +43,18 @@ function drawMarker(ctx: CanvasRenderingContext2D, cx: number, cy: number, radiu
   ctx.restore()
 }
 
+/** 選んだ範囲の印。白い縁取りの上に赤い四角を重ねる */
+function drawRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, line: number) {
+  ctx.save()
+  ctx.lineWidth = line * 2
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.95)'
+  ctx.strokeRect(x, y, w, h)
+  ctx.lineWidth = line
+  ctx.strokeStyle = 'rgb(230, 0, 0)'
+  ctx.strokeRect(x, y, w, h)
+  ctx.restore()
+}
+
 function toJpegBase64(canvas: HTMLCanvasElement): string {
   return canvas.toDataURL('image/jpeg', 0.88).split(',')[1]
 }
@@ -80,6 +93,44 @@ export async function captureAround(page: PDFPageProxy, x: number, y: number): P
   const dy = Math.round(Math.min(Math.max(py - dh / 2, 0), H - dh))
   const detail = copyRegion(src, dx, dy, dw, dh)
   drawMarker(detail.ctx, (px - dx) * detail.scale, (py - dy) * detail.scale, W * 0.035 * detail.scale)
+
+  return { pageImage: toJpegBase64(whole.canvas), detailImage: toJpegBase64(detail.canvas) }
+}
+
+/** 選んだ範囲の周りに足す余白（ページの幅に対する割合）。範囲の端にかかった文字も読めるように */
+const REGION_MARGIN = 0.03
+
+/**
+ * ドラッグで選んだ範囲 box（ページに対する 0〜1 の割合）から、VLM に送る2枚の画像を作る。
+ * 1枚目はページ全体に範囲の四角を描いたもの、2枚目は範囲を拡大したもの。
+ */
+export async function captureRegion(page: PDFPageProxy, box: Box): Promise<CapturedImages> {
+  const src = await hiResCanvas(page)
+  const W = src.width
+  const H = src.height
+  const l = box.left * W
+  const t = box.top * H
+  const r = box.right * W
+  const b = box.bottom * H
+  const line = Math.max(3, W * 0.003)
+
+  const whole = copyRegion(src, 0, 0, W, H)
+  drawRect(whole.ctx, l * whole.scale, t * whole.scale, (r - l) * whole.scale, (b - t) * whole.scale, line * whole.scale)
+
+  const m = W * REGION_MARGIN
+  const cl = Math.max(0, l - m)
+  const ct = Math.max(0, t - m)
+  const cr = Math.min(W, r + m)
+  const cb = Math.min(H, b + m)
+  const detail = copyRegion(src, cl, ct, cr - cl, cb - ct)
+  drawRect(
+    detail.ctx,
+    (l - cl) * detail.scale,
+    (t - ct) * detail.scale,
+    (r - l) * detail.scale,
+    (b - t) * detail.scale,
+    line * detail.scale,
+  )
 
   return { pageImage: toJpegBase64(whole.canvas), detailImage: toJpegBase64(detail.canvas) }
 }
