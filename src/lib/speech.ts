@@ -43,35 +43,63 @@ if (speechSupported) {
 // ---------- 共通 ----------
 
 /**
- * 最初のかたまりを切ってよい助詞（は・が・を・に・で・も・と・の）。
+ * VOICEVOX でかたまりを切ってよい助詞（は・が・を・に・で・も・と・の）。
  * 「では」「ときに」のような言い回しの中で切らないよう、前後が漢字・カタカナ（後ろは数字も可）のところに限る。
  * 例: 「エントロピーは｜情報量の…」「レポートの｜締め切りは…」
  */
 const SPLIT_PARTICLE = /(?<=[\u4e00-\u9fff\u30a0-\u30ff])[はがをにでもとの](?=[\u4e00-\u9fff\u30a0-\u30ff0-9])/g
+const COMMA = /[、，,]/g
 
-/** 最初のかたまりを短くする。読点があればそこで、なければ助詞の後で切る */
+/** VOICEVOX で2つ目以降のかたまりの長さの目安。続けてクリックしたとき、作りかけの音声を待つ時間がこれで決まる */
+const MAX_CHUNK = 16
+/** 切った後に残る部分の最小の長さ（「です」だけのような細切れにしない） */
+const MIN_PIECE = 3
+
+/** 切れ目（読点か助詞の直後）の位置を、前から順に返す。読点を先に探す */
+function cutPoints(s: string): { comma: number[]; particle: number[] } {
+  const ok = (e: number) => e >= MIN_PIECE + 1 && s.length - e >= MIN_PIECE
+  return {
+    comma: [...s.matchAll(COMMA)].map((m) => m.index + 1).filter(ok),
+    particle: [...s.matchAll(SPLIT_PARTICLE)].map((m) => m.index + 1).filter(ok),
+  }
+}
+
+/** 最初のかたまりはできるだけ早く鳴らしたいので、14文字以内で一番前の切れ目で切る */
 function splitFirstChunk(first: string): string[] {
   if (first.length <= 8) return [first]
-  const comma = first.search(/[、，,]/)
-  if (comma >= 3 && comma < 20) return [first.slice(0, comma + 1), first.slice(comma + 1)]
-  for (const m of first.matchAll(SPLIT_PARTICLE)) {
-    const end = m.index + 1
-    if (end >= 4 && end <= 14) return [first.slice(0, end), first.slice(end)]
+  const { comma, particle } = cutPoints(first)
+  const cut = comma.find((e) => e < 20) ?? particle.find((e) => e <= 14)
+  return cut ? [first.slice(0, cut), first.slice(cut)] : [first]
+}
+
+/** 2つ目以降は MAX_CHUNK 文字以内の一番後ろの切れ目で切る（切れ目を増やしすぎないため）。なければその先の最初の切れ目 */
+function splitShort(s: string): string[] {
+  const out: string[] = []
+  let rest = s
+  while (rest.length > MAX_CHUNK) {
+    const { comma, particle } = cutPoints(rest)
+    const within = (list: number[]) => list.filter((e) => e <= MAX_CHUNK).at(-1)
+    const cut = within(comma) ?? within(particle) ?? [...comma, ...particle].sort((a, b) => a - b)[0]
+    if (!cut) break
+    out.push(rest.slice(0, cut))
+    rest = rest.slice(cut)
   }
-  return [first]
+  out.push(rest)
+  return out
 }
 
 /**
  * 長い文を一度に渡すと途中で止まったり、最初の声が出るまで待たされたりするので、短く区切る。
- * shortFirst: VOICEVOX 用。声が出るまでの時間は最初のかたまりの長さで決まり、
- * 2つ目以降は再生中に合成できるので、最初だけさらに短く切る（ブラウザの声では不要な間ができるのでしない）
+ * voicevox: VOICEVOX は1文字あたり約50ミリ秒かけて合成してから鳴らすので、さらに短く切る。
+ * 声が出るまでの時間は最初のかたまりの長さで、続けてクリックしたときの待ちは作りかけのかたまりの長さで決まる。
+ * （ブラウザの声では不要な間ができるだけなので切らない）
  */
-function splitText(text: string, shortFirst: boolean): string[] {
+function splitText(text: string, voicevox: boolean): string[] {
   const sentences = text
     .split(/(?<=[。．！？!?])|\n+/)
     .map((s) => s.trim())
     .filter((s) => s.length > 0)
-  // 長い文は読点で区切る（VOICEVOX は合成に1文字あたり約50ミリ秒かかるため）
+  // 長い文は読点で区切る
   const parts = sentences.flatMap((s) => {
     if (s.length <= 40) return [s]
     const out: string[] = []
@@ -86,8 +114,9 @@ function splitText(text: string, shortFirst: boolean): string[] {
     if (buf) out.push(buf)
     return out
   })
-  if (shortFirst && parts.length > 0) parts.splice(0, 1, ...splitFirstChunk(parts[0]))
-  return parts.filter((p) => p.trim().length > 0)
+  if (!voicevox) return parts
+  if (parts.length > 0) parts.splice(0, 1, ...splitFirstChunk(parts[0]))
+  return parts.flatMap(splitShort).filter((p) => p.trim().length > 0)
 }
 
 let session = 0
