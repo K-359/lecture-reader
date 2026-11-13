@@ -3,6 +3,8 @@ import { readAt, type ReadUnit } from './lib/api'
 import { captureAround } from './lib/capture'
 import { isCancelled, openPdf, pageAspect, renderPage, type PDFDocumentProxy, type PDFPageProxy } from './lib/pdf'
 import { speak, speechSupported, stopSpeech, unlockSpeech } from './lib/speech'
+import { toSpeakable } from './lib/speechText'
+import { findTextAt, prefetchText, type Box } from './lib/textLayer'
 import './App.css'
 
 type Status =
@@ -10,6 +12,10 @@ type Status =
   | { kind: 'reading' }
   | { kind: 'speaking' }
   | { kind: 'error'; message: string }
+
+/** auto: PDF の文字データを先に使い、取れなかったときだけ VLM。ai: いつも VLM */
+type ReadMode = 'auto' | 'ai'
+type Source = 'pdf' | 'ai'
 
 const ZOOM_STEPS = [0.6, 0.75, 0.9, 1, 1.25, 1.5, 2]
 const RATE_MIN = 0.6
@@ -30,6 +36,9 @@ export default function App() {
   const [rate, setRate] = useState(() => loadNumber('rate', 1))
   const [status, setStatus] = useState<Status>({ kind: 'idle' })
   const [text, setText] = useState('')
+  const [mode, setMode] = useState<ReadMode>(() => (localStorage.getItem('mode') === 'ai' ? 'ai' : 'auto'))
+  const [result, setResult] = useState<{ source: Source; ms: number } | null>(null)
+  const [highlights, setHighlights] = useState<Box[]>([])
   const [marker, setMarker] = useState<{ x: number; y: number } | null>(null)
   const [dragging, setDragging] = useState(false)
   const [viewerWidth, setViewerWidth] = useState(0)
@@ -41,6 +50,7 @@ export default function App() {
 
   useEffect(() => localStorage.setItem('unit', unit), [unit])
   useEffect(() => localStorage.setItem('rate', String(rate)), [rate])
+  useEffect(() => localStorage.setItem('mode', mode), [mode])
 
   // 表示領域の幅に合わせてページを描くため、幅の変化を見張る
   useEffect(() => {
@@ -65,6 +75,8 @@ export default function App() {
       setFileName(file.name)
       setPageNumber(1)
       setMarker(null)
+      setHighlights([])
+      setResult(null)
       setText('')
       setStatus({ kind: 'idle' })
     } catch {
@@ -76,7 +88,11 @@ export default function App() {
   useEffect(() => {
     if (!doc) return
     let alive = true
-    void doc.getPage(pageNumber).then((p) => alive && setPage(p))
+    void doc.getPage(pageNumber).then((p) => {
+      if (!alive) return
+      prefetchText(p)
+      setPage(p)
+    })
     return () => {
       alive = false
     }
@@ -103,7 +119,7 @@ export default function App() {
   const say = useCallback(
     (t: string) => {
       setStatus({ kind: 'speaking' })
-      speak(t, rate, () => setStatus((s) => (s.kind === 'speaking' ? { kind: 'idle' } : s)))
+      speak(toSpeakable(t), rate, () => setStatus((s) => (s.kind === 'speaking' ? { kind: 'idle' } : s)))
     },
     [rate],
   )
@@ -121,13 +137,27 @@ export default function App() {
     abortRef.current = controller
 
     setMarker({ x, y })
+    setHighlights([])
     setStatus({ kind: 'reading' })
+    const startedAt = performance.now()
     try {
-      const images = await captureAround(page, x, y)
-      const result = await readAt(images, x, y, unit, controller.signal)
+      // まず PDF の文字データから探す（一瞬で返る）
+      const hit = mode === 'auto' ? await findTextAt(page, x, y, unit).catch(() => null) : null
       if (controller.signal.aborted) return
-      setText(result)
-      say(result)
+      if (hit) {
+        setText(hit.text)
+        setHighlights(hit.boxes)
+        setResult({ source: 'pdf', ms: performance.now() - startedAt })
+        say(hit.text)
+        return
+      }
+      // 文字データがない・図の上・AI を選んだとき は VLM で読み取る
+      const images = await captureAround(page, x, y)
+      const read = await readAt(images, x, y, unit, controller.signal)
+      if (controller.signal.aborted) return
+      setText(read)
+      setResult({ source: 'ai', ms: performance.now() - startedAt })
+      say(read)
     } catch (err) {
       if (controller.signal.aborted) return
       setStatus({ kind: 'error', message: err instanceof Error ? err.message : '読み取りに失敗しました。' })
@@ -140,6 +170,7 @@ export default function App() {
       if (n < 1 || n > numPages) return
       stop()
       setMarker(null)
+      setHighlights([])
       setPageNumber(n)
       viewerRef.current?.scrollTo({ top: 0 })
     },
@@ -254,6 +285,25 @@ export default function App() {
           </button>
         </div>
 
+        <div className="group" role="group" aria-label="読み取り方">
+          <button
+            type="button"
+            className={`btn toggle ${mode === 'auto' ? 'on' : ''}`}
+            aria-pressed={mode === 'auto'}
+            onClick={() => setMode('auto')}
+          >
+            自動
+          </button>
+          <button
+            type="button"
+            className={`btn toggle ${mode === 'ai' ? 'on' : ''}`}
+            aria-pressed={mode === 'ai'}
+            onClick={() => setMode('ai')}
+          >
+            AI
+          </button>
+        </div>
+
         <label className="rate">
           <span>速さ {rate.toFixed(1)}</span>
           <input
@@ -277,7 +327,20 @@ export default function App() {
               onClick={onPageClick}
               aria-label={`${fileName} の ${pageNumber} ページ目。読みたい場所をクリックしてください`}
             />
-            {marker && (
+            {highlights.map((b, i) => (
+              <div
+                key={i}
+                className="highlight"
+                style={{
+                  left: `${b.left * 100}%`,
+                  top: `${b.top * 100}%`,
+                  width: `${(b.right - b.left) * 100}%`,
+                  height: `${(b.bottom - b.top) * 100}%`,
+                }}
+                aria-hidden="true"
+              />
+            ))}
+            {marker && highlights.length === 0 && (
               <div
                 className={`marker ${status.kind === 'reading' ? 'pulse' : ''}`}
                 style={{ left: `${marker.x * 100}%`, top: `${marker.y * 100}%` }}
@@ -299,6 +362,11 @@ export default function App() {
           {status.kind === 'reading' && <span className="badge">読み取り中…</span>}
           {status.kind === 'speaking' && <span className="badge speaking">読み上げ中</span>}
           {status.kind === 'error' && <span className="badge error">{status.message}</span>}
+          {result && status.kind !== 'error' && status.kind !== 'reading' && (
+            <span className="badge source">
+              {result.source === 'pdf' ? 'PDFの文字' : 'AIで読み取り'}・{(result.ms / 1000).toFixed(1)}秒
+            </span>
+          )}
           {!speechSupported && <span className="badge error">このブラウザは読み上げに対応していません</span>}
         </div>
         <p className="reader-text">{text || '読み取った文字がここに大きく表示されます。'}</p>

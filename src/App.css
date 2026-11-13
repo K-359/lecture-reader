@@ -114,6 +114,17 @@
   pointer-events: none;
 }
 
+.highlight {
+  position: absolute;
+  margin: -3px;
+  padding: 3px;
+  box-sizing: content-box;
+  background: rgba(255, 212, 0, 0.35);
+  outline: 3px solid #e6a800;
+  border-radius: 4px;
+  pointer-events: none;
+}
+
 .marker.pulse {
   animation: pulse 1s ease-in-out infinite;
 }
@@ -173,6 +184,11 @@
 
 .badge.speaking {
   background: var(--focus);
+}
+
+.badge.source {
+  color: var(--text);
+  background: var(--surface-2);
 }
 
 .badge.error {
