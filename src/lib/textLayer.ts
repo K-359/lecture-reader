@@ -119,6 +119,15 @@ function getLines(page: PDFPageProxy) {
   return p
 }
 
+/** 文字の行の範囲（ページに対する 0〜1 の割合）と文字の大きさ。図のラベルを図の範囲に含めるのに使う */
+export async function textLineBoxes(page: PDFPageProxy): Promise<{ box: Box; size: number }[]> {
+  const { lines, width, height } = await getLines(page)
+  return lines.map((l) => ({
+    box: { left: l.box.left / width, right: l.box.right / width, top: l.box.top / height, bottom: l.box.bottom / height },
+    size: l.size / height,
+  }))
+}
+
 /**
  * ページに文字データがあるか。ある（スキャンではない）のにクリック位置に文字がなければ、
  * そこは図の上だと考えられる

@@ -164,8 +164,8 @@
   pointer-events: none;
 }
 
-.page-canvas.figure-mode {
-  /* 「図」のときはタッチのドラッグを範囲選択に使う */
+.page-canvas.touch-select {
+  /* ページが画面に収まっているときは、指のドラッグを範囲選択に使う */
   touch-action: none;
 }
 

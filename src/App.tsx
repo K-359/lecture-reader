@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type MouseEvent, type PointerEvent } from 'react'
-import { explainAt, readAt, type ExplainTarget, type ReadUnit } from './lib/api'
+import { explainAt, readAt, type ExplainTarget } from './lib/api'
 import { captureAround, captureRegion } from './lib/capture'
+import { figureAt, prefetchFigures } from './lib/figures'
 import { isCancelled, openPdf, pageAspect, renderPage, type PDFDocumentProxy, type PDFPageProxy } from './lib/pdf'
 import {
   fetchVoicevoxStyles,
@@ -21,11 +22,7 @@ type Status =
   | { kind: 'speaking' }
   | { kind: 'error'; message: string }
 
-/** auto: PDF の文字データを先に使い、取れなかったときだけ VLM。ai: いつも VLM */
-type ReadMode = 'auto' | 'ai'
 type Source = 'pdf' | 'ai' | 'figure'
-/** クリックで読む範囲。figure: クリックした場所にある図を説明する */
-type PickUnit = ReadUnit | 'figure'
 
 /** 説明した図。同じ図をもう一度押すか「くわしく」で detail を読む */
 type Figure = { pageNumber: number; box: Box | null; summary: string; detail: string; showing: 'summary' | 'detail' }
@@ -49,11 +46,6 @@ function boxFrom(rect: DOMRect, x0: number, y0: number, x1: number, y1: number):
   }
 }
 
-function loadUnit(): PickUnit {
-  const v = localStorage.getItem('unit')
-  return v === 'line' || v === 'figure' ? v : 'block'
-}
-
 /** 100% = ページ全体が画面に収まる大きさ */
 const ZOOM_STEPS = [0.6, 0.75, 0.9, 1, 1.25, 1.5, 2, 2.5, 3]
 const RATE_MIN = 0.6
@@ -70,11 +62,9 @@ export default function App() {
   const [pageNumber, setPageNumber] = useState(1)
   const [page, setPage] = useState<PDFPageProxy | null>(null)
   const [zoomIndex, setZoomIndex] = useState(3)
-  const [unit, setUnit] = useState<PickUnit>(loadUnit)
   const [rate, setRate] = useState(() => loadNumber('rate', 1))
   const [status, setStatus] = useState<Status>({ kind: 'idle' })
   const [text, setText] = useState('')
-  const [mode, setMode] = useState<ReadMode>(() => (localStorage.getItem('mode') === 'ai' ? 'ai' : 'auto'))
   const [result, setResult] = useState<{ source: Source; ms: number } | null>(null)
   /** クリックしてから声が出始めるまでの時間 */
   const [voiceMs, setVoiceMs] = useState<number | null>(null)
@@ -102,7 +92,6 @@ export default function App() {
   /** ドラッグを終えた直後の click は、クリックとして扱わない */
   const suppressClickRef = useRef(false)
 
-  useEffect(() => localStorage.setItem('unit', unit), [unit])
   useEffect(() => localStorage.setItem('rate', String(rate)), [rate])
   useEffect(() => localStorage.setItem('engine', engine), [engine])
   useEffect(() => localStorage.setItem('speaker', String(speaker)), [speaker])
@@ -122,7 +111,6 @@ export default function App() {
       alive = false
     }
   }, [engine])
-  useEffect(() => localStorage.setItem('mode', mode), [mode])
 
   // 表示領域の大きさに合わせてページを描くため、大きさの変化を見張る
   useEffect(() => {
@@ -167,6 +155,7 @@ export default function App() {
     void doc.getPage(pageNumber).then((p) => {
       if (!alive) return
       prefetchText(p)
+      prefetchFigures(p)
       setPage(p)
     })
     return () => {
@@ -179,6 +168,7 @@ export default function App() {
   const fitWidth = Math.min(viewerSize.width, viewerSize.height / aspect)
   const cssWidth = Math.max(200, Math.floor(fitWidth * ZOOM_STEPS[zoomIndex]))
   const cssHeight = Math.floor(cssWidth * aspect)
+  const pageFits = cssWidth <= viewerSize.width + 1 && cssHeight <= viewerSize.height + 1
   const viewerWidth = viewerSize.width
   useEffect(() => {
     const canvas = canvasRef.current
@@ -231,13 +221,21 @@ export default function App() {
   }
 
   /** 図を説明させ、まずひとこと（summary）を読む */
-  const explain = async (p: PDFPageProxy, target: ExplainTarget, controller: AbortController, startedAt: number) => {
+  const explain = async (
+    p: PDFPageProxy,
+    target: ExplainTarget,
+    controller: AbortController,
+    startedAt: number,
+    /** PDF から推定した図の範囲。あればモデルの返す範囲より正確なので、こちらで囲む */
+    region: Box | null = null,
+  ) => {
     const images = target.type === 'point' ? await captureAround(p, target.x, target.y) : await captureRegion(p, target)
     const ex = await explainAt(images, target, controller.signal)
     if (controller.signal.aborted) return
-    setFigure(ex.detail ? { pageNumber, box: ex.bbox, summary: ex.summary, detail: ex.detail, showing: 'summary' } : null)
+    const box = target.type === 'point' ? (region ?? ex.bbox) : ex.bbox
+    setFigure(ex.detail ? { pageNumber, box, summary: ex.summary, detail: ex.detail, showing: 'summary' } : null)
     setSelection(null)
-    setHighlights(ex.bbox ? [ex.bbox] : [])
+    setHighlights(box ? [box] : [])
     setText(ex.summary)
     setResult({ source: 'figure', ms: performance.now() - startedAt })
     say(ex.summary, startedAt)
@@ -275,9 +273,12 @@ export default function App() {
     setHighlights([])
     setSelection(null)
     try {
-      // まず PDF の文字データから探す（一瞬で返る）
-      if (unit !== 'figure' && mode === 'auto') {
-        const hit = await findTextAt(page, x, y, unit).catch(() => null)
+      // 押した場所が図の中か（図の中のラベルを押したときも、図の説明にする）
+      const region = await figureAt(page, x, y)
+      if (controller.signal.aborted) return
+      // 図の外なら、PDF の文字データからまとまりを探して読む（一瞬で返る）
+      if (!region) {
+        const hit = await findTextAt(page, x, y, 'block').catch(() => null)
         if (controller.signal.aborted) return
         if (hit) {
           setFigure(null)
@@ -293,16 +294,15 @@ export default function App() {
         showDetail(figure, startedAt)
         return
       }
-      // 「図」を選んだとき、または文字データのあるページで文字のない場所（＝図の上）を押したときは、図を説明する
-      const onFigure = unit === 'figure' || (mode === 'auto' && (await pageHasText(page).catch(() => false)))
-      if (controller.signal.aborted) return
-      if (onFigure) {
-        await explain(page, { type: 'point', x, y }, controller, startedAt)
+      // 図の上、または文字データのあるページで文字のない場所を押したときは、図を説明する
+      if (region || (await pageHasText(page).catch(() => false))) {
+        if (controller.signal.aborted) return
+        await explain(page, { type: 'point', x, y }, controller, startedAt, region)
         return
       }
-      // 文字データがない（スキャンした）PDF や、AI を選んだときは VLM で書き起こす
+      // 文字データがない（スキャンした）PDF や、文字化けしているときは VLM で書き起こす
       const images = await captureAround(page, x, y)
-      const read = await readAt(images, x, y, unit === 'line' ? 'line' : 'block', controller.signal)
+      const read = await readAt(images, x, y, 'block', controller.signal)
       if (controller.signal.aborted) return
       setFigure(null)
       setText(read)
@@ -314,12 +314,13 @@ export default function App() {
   }
 
   // ---------- ドラッグで範囲を選ぶ ----------
-  // マウスはいつでも。タッチはドラッグがスクロールと重なるので「図」を選んでいるときだけ
+  // マウスはいつでも。タッチは、ページが画面に収まっていてスクロールの必要がないときだけ
+  // （拡大してはみ出しているときは、指のドラッグをスクロールに使う）
 
   const onPointerDown = (e: PointerEvent<HTMLCanvasElement>) => {
     suppressClickRef.current = false
     if (!page || e.button !== 0) return
-    if (e.pointerType !== 'mouse' && unit !== 'figure') return
+    if (e.pointerType !== 'mouse' && !pageFits) return
     dragRef.current = { id: e.pointerId, x0: e.clientX, y0: e.clientY, active: false }
   }
 
@@ -469,52 +470,6 @@ export default function App() {
             </>
           )}
 
-          <div className="group" role="group" aria-label="読む範囲">
-            <button
-              type="button"
-              className={`btn toggle ${unit === 'block' ? 'on' : ''}`}
-              aria-pressed={unit === 'block'}
-              onClick={() => setUnit('block')}
-            >
-              まとまり
-            </button>
-            <button
-              type="button"
-              className={`btn toggle ${unit === 'line' ? 'on' : ''}`}
-              aria-pressed={unit === 'line'}
-              onClick={() => setUnit('line')}
-            >
-              1行
-            </button>
-            <button
-              type="button"
-              className={`btn toggle ${unit === 'figure' ? 'on' : ''}`}
-              aria-pressed={unit === 'figure'}
-              onClick={() => setUnit('figure')}
-            >
-              図
-            </button>
-          </div>
-
-          <div className="group" role="group" aria-label="読み取り方">
-            <button
-              type="button"
-              className={`btn toggle ${mode === 'auto' ? 'on' : ''}`}
-              aria-pressed={mode === 'auto'}
-              onClick={() => setMode('auto')}
-            >
-              自動
-            </button>
-            <button
-              type="button"
-              className={`btn toggle ${mode === 'ai' ? 'on' : ''}`}
-              aria-pressed={mode === 'ai'}
-              onClick={() => setMode('ai')}
-            >
-              AI
-            </button>
-          </div>
-
           <div className="group" role="group" aria-label="声">
             <button
               type="button"
@@ -590,7 +545,7 @@ export default function App() {
           <div className="page" style={{ width: cssWidth, height: cssHeight }}>
             <canvas
               ref={canvasRef}
-              className={`page-canvas ${unit === 'figure' ? 'figure-mode' : ''}`}
+              className={`page-canvas ${pageFits ? 'touch-select' : ''}`}
               style={{ width: cssWidth, height: cssHeight }}
               onClick={onPageClick}
               onPointerDown={onPointerDown}
@@ -637,7 +592,8 @@ export default function App() {
             <p>講義資料のPDFを開いてください。</p>
             <p>ここにファイルを落としても開けます。</p>
             <p>開いたら、読みたい場所をクリック（タップ）すると読み上げます。</p>
-            <p>図の説明を聞くには「図」を選んでクリックするか、説明してほしい所をドラッグで囲みます。</p>
+            <p>図やグラフを押すと、何の図かをひとことで説明します。もう一度押すと、くわしく説明します。</p>
+            <p>説明してほしい所をドラッグで囲むと、その範囲だけを説明します。</p>
             <p>スペースキーで、上と下のメニューを隠して画面を広く使えます。</p>
           </div>
         )}
