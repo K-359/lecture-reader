@@ -8,8 +8,11 @@ import { buildReadPrompt, SYSTEM_PROMPT, type ReadUnit } from './prompt.ts'
 config({ override: true })
 
 const PORT = Number(process.env.PORT ?? 8787)
-const MODEL = process.env.READER_MODEL ?? 'claude-opus-5-5'
+// 読み取りは書き起こしだけなので、速さを優先して Haiku の思考なしを既定にする
+const MODEL = process.env.READER_MODEL ?? 'claude-haiku-5-5'
 const EFFORT = (process.env.READER_EFFORT ?? 'low') as 'low' | 'medium' | 'high'
+// Haiku 5.5 で思考を切れるのは effort が high 以下のとき。Opus 5.5 などは切れないので READER_THINKING=on にする
+const THINKING_ON = process.env.READER_THINKING === 'on'
 
 const hasCredentials = Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN)
 const NO_KEY_MESSAGE = 'APIキーが設定されていません。.env に ANTHROPIC_API_KEY を書いてください。'
@@ -50,13 +53,11 @@ app.post('/api/read', async (c) => {
 
   const startedAt = Date.now()
   try {
-    const response = await client.beta.messages.create({
+    const response = await client.messages.create({
       model: MODEL,
       max_tokens: 16000,
+      thinking: THINKING_ON ? { type: 'adaptive' } : { type: 'disabled' },
       output_config: { effort: EFFORT },
-      // 安全分類器に断られたときは、サーバー側で別のモデルに自動で切り替える
-      betas: ['server-side-fallback-2026-07-01'],
-      fallbacks: 'default',
       system: SYSTEM_PROMPT,
       messages: [
         {
@@ -111,6 +112,6 @@ app.post('/api/read', async (c) => {
 })
 
 serve({ fetch: app.fetch, port: PORT }, (info) => {
-  console.log(`API server: http://localhost:${info.port} (model: ${MODEL}, effort: ${EFFORT})`)
+  console.log(`API server: http://localhost:${info.port} (model: ${MODEL}, effort: ${EFFORT}, thinking: ${THINKING_ON ? 'on' : 'off'})`)
   if (!hasCredentials) console.warn(`⚠ ${NO_KEY_MESSAGE}`)
 })

@@ -39,6 +39,7 @@ npm run dev
 | 変数 | 既定値 | 内容 |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | — | Claude API のキー |
-| `READER_MODEL` | `claude-opus-5-5` | 読み取りに使うモデル |
-| `READER_EFFORT` | `low` | 思考の深さ（`low` / `medium` / `high`） |
+| `READER_MODEL` | `claude-haiku-5-5` | 読み取りに使うモデル |
+| `READER_EFFORT` | `low` | effort（`low` / `medium` / `high`） |
+| `READER_THINKING` | `off` | 思考の有無。思考を切れないモデル（`claude-opus-5-5` など）では `on` にする |
 | `PORT` | `8787` | API サーバーのポート |
